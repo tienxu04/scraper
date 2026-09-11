@@ -77,14 +77,54 @@ def fetch_html(url: str, timeout: float = 20, retries: int = 2):
 
 
 def extract_article(url: str, raw_html: str, response) -> dict:
-    text = trafilatura.extract(
+    extracted_html = trafilatura.extract(
         raw_html,
         include_comments=False,
         include_tables=True,
         include_links=False,
         favor_precision=True,
-        output_format="txt",
+        output_format="html",
     ) or ""
+
+    # Keep the block structure returned by Trafilatura. Converting directly to
+    # plain text can collapse several publisher paragraphs into one long block.
+    extracted_soup = BeautifulSoup(extracted_html, "html.parser")
+    blocks = []
+    for node in extracted_soup.find_all(["h1", "h2", "h3", "h4", "p", "blockquote", "li"]):
+        value = node.get_text(" ", strip=True)
+        if value:
+            blocks.append(value)
+
+    if not blocks:
+        plain_text = trafilatura.extract(
+            raw_html,
+            include_comments=False,
+            include_tables=True,
+            include_links=False,
+            favor_precision=True,
+            output_format="txt",
+        ) or ""
+        blocks = [part.strip() for part in re.split(r"\n{2,}", plain_text) if part.strip()]
+
+    # Some pages expose one unusually large text block. Split only such blocks,
+    # and only at sentence boundaries, so ordinary short paragraphs stay intact.
+    normalized_blocks = []
+    for block in blocks:
+        if len(block) <= 1100:
+            normalized_blocks.append(block)
+            continue
+        sentences = re.split(r"(?<=[.!?])\s+(?=[A-ZÀ-Ỵ“‘\"\d])", block)
+        current = ""
+        for sentence in sentences:
+            if current and len(current) + len(sentence) + 1 > 700:
+                normalized_blocks.append(current.strip())
+                current = sentence
+            else:
+                current = f"{current} {sentence}".strip()
+        if current:
+            normalized_blocks.append(current.strip())
+
+    text = "\n\n".join(normalized_blocks)
 
     soup = BeautifulSoup(raw_html, "html.parser")
     title = ""
@@ -115,7 +155,7 @@ def make_reader_html(article: dict) -> str:
     url = html.escape(article["url"])
     paragraphs = "\n".join(
         f"<p>{html.escape(p.strip())}</p>"
-        for p in re.split(r"\n{2,}", article["text"])
+        for p in article["text"].split("\n\n")
         if p.strip()
     )
     return f"""<!doctype html>
@@ -126,14 +166,14 @@ def make_reader_html(article: dict) -> str:
 <style>
 body{{font-family:system-ui,-apple-system,sans-serif;line-height:1.75;max-width:760px;margin:3rem auto;padding:0 1.2rem;color:#222;background:#fff}}
 .meta{{color:#666;border-bottom:1px solid #ddd;padding-bottom:1rem;margin-bottom:2rem}}
-p{{font-size:1.05rem}}
+p{{font-size:1.05rem;margin:0 0 1.35em}}
 </style>
 </head>
 <body><div class="meta"><strong>{title}</strong><br>Source: <a href="{url}">{url}</a></div>{paragraphs}</body>
 </html>"""
 
 
-st.set_page_config(page_title="Article Reader", page_icon="📰", layout="wide")
+st.set_page_config(page_title="Article Reader v1.5", page_icon="📰", layout="wide")
 st.title("Article Reader")
 st.caption(
     "Đọc và làm sạch nội dung HTML công khai. Ứng dụng không vượt paywall, "
