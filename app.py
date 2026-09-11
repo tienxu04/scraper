@@ -1,156 +1,201 @@
-import streamlit as st
-import re
-import html
-import urllib.request
-import ssl
-import time
+from __future__ import annotations
 
-# Cấu hình giao diện trang web Streamlit
-st.set_page_config(
-    page_title="Web Article Reader & Scraper",
-    page_icon="📰",
-    layout="wide"
+import html
+import re
+import time
+from pathlib import Path
+from urllib.parse import urlparse
+
+import requests
+import streamlit as st
+import trafilatura
+from bs4 import BeautifulSoup
+
+APP_USER_AGENT = (
+    "ArticleReaderStreamlit/1.0 (+personal reader; "
+    "respect publisher access controls)"
 )
 
-# ==========================================
-# LOGIC CÀO BÀI VIẾT V8 (CLEAN HTML MAIN CONTENT)
-# ==========================================
-def clean_html_content(html_content):
-    # 1. Xóa các thẻ rác/không chứa nội dung chính
-    non_content_tags = r'<(script|style|svg|noscript|iframe|header|footer|nav|aside|form)[^>]*>.*?</\1>'
-    cleaned = re.sub(non_content_tags, '', html_content, flags=re.DOTALL | re.IGNORECASE)
-    cleaned = re.sub(r'<!--.*?-->', '', cleaned, flags=re.DOTALL)
 
-    # 2. Xóa các khối class/id rác
-    junk_patterns = r'<(div|section|ul|ol|aside)[^>]*(id|class)=["\'][^"\']*(menu|nav|sidebar|footer|header|widget|related|comment|cookie|banner|advertisement|share|social)[^"\']*["\'][^>]*>.*?</\1>'
-    cleaned = re.sub(junk_patterns, '', cleaned, flags=re.DOTALL | re.IGNORECASE)
+class FetchError(RuntimeError):
+    pass
 
-    # 3. Quy đổi Block elements thành '\n'
-    block_tags = r'</?(p|div|h[1-6]|li|td|th|tr|blockquote|section|article|br|hr)[^>]*>'
-    cleaned = re.sub(block_tags, '\n', cleaned, flags=re.IGNORECASE)
 
-    # 4. Thay Inline tags bằng khoảng trắng
-    cleaned = re.sub(r'<[^>]+>', ' ', cleaned)
-    text = html.unescape(cleaned)
+def validate_url(url: str) -> str:
+    url = url.strip()
+    if not re.match(r"^https?://", url, flags=re.I):
+        url = "https://" + url
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise FetchError("URL không hợp lệ. Hãy dùng dạng https://example.com/article.")
+    return url
 
-    # 5. Lọc các đoạn văn chất lượng
-    paragraphs = []
-    for line in text.splitlines():
-        line_str = re.sub(r'\s+', ' ', line).strip()
-        if len(line_str) > 40 or re.search(r'[\.\?!]$', line_str):
-            paragraphs.append(line_str)
 
-    return paragraphs
+def fetch_html(url: str, timeout: float = 20, retries: int = 2):
+    url = validate_url(url)
+    headers = {
+        "User-Agent": APP_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "vi,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate",
+    }
+    last_error = None
+    with requests.Session() as session:
+        session.headers.update(headers)
+        for attempt in range(retries + 1):
+            try:
+                response = session.get(url, timeout=timeout, allow_redirects=True)
+                if response.status_code == 403:
+                    raise FetchError(
+                        "Máy chủ trả về 403 Forbidden. Trang đang yêu cầu quyền "
+                        "truy cập hoặc chặn client tự động. Ứng dụng không vượt qua "
+                        "paywall, CAPTCHA hay cơ chế anti-bot."
+                    )
+                if response.status_code in {401, 402}:
+                    raise FetchError(
+                        f"Trang yêu cầu quyền truy cập (HTTP {response.status_code}). "
+                        "Chế độ public không thể đọc trang này."
+                    )
+                if response.status_code >= 400:
+                    raise FetchError(f"Máy chủ trả về HTTP {response.status_code}.")
+                content_type = response.headers.get("content-type", "")
+                if "html" not in content_type.lower():
+                    raise FetchError(
+                        f"URL không trả về HTML (Content-Type: {content_type})."
+                    )
+                response.encoding = (
+                    response.encoding or response.apparent_encoding or "utf-8"
+                )
+                return response.text, response
+            except FetchError:
+                raise
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt < retries:
+                    time.sleep(0.8 * (attempt + 1))
+    raise FetchError(f"Không tải được URL sau {retries + 1} lần thử: {last_error}")
 
-# ==========================================
-# GIAO DIỆN STREAMLIT WEB APP
-# ==========================================
-st.title("📰 Web Article Reader & Scraper")
-st.caption("Dán URL bài viết báo để tự động lọc sạch rác, xem nội dung trọn vẹn và tải file HTML Reader Mode.")
 
-# Sử dụng Session State để quản lý dữ liệu khi bấm Clear
-if "scraped_data" not in st.session_state:
-    st.session_state.scraped_data = None
+def extract_article(url: str, raw_html: str, response) -> dict:
+    text = trafilatura.extract(
+        raw_html,
+        include_comments=False,
+        include_tables=True,
+        include_links=False,
+        favor_precision=True,
+        output_format="txt",
+    ) or ""
 
-col1, col2 = st.columns([1, 1], gap="large")
+    soup = BeautifulSoup(raw_html, "html.parser")
+    title = ""
+    og_title = soup.find("meta", attrs={"property": "og:title"})
+    if og_title and og_title.get("content"):
+        title = og_title["content"].strip()
+    if not title and soup.title:
+        title = soup.title.get_text(" ", strip=True)
+    title = title or "Untitled article"
 
-# --- CỘT TRÁI: NHẬP URL & THAO TÁC ---
-with col1:
-    st.subheader("⚙️ Thao tác")
-    
-    url_input = st.text_input(
-        "🔗 Nhập URL bài viết cần cào:", 
-        placeholder="https://example.com/bai-viet...",
-        key="url_input_key"
+    if len(text.strip()) < 120:
+        raise FetchError(
+            "Tải HTML thành công nhưng không tìm thấy đủ nội dung bài viết. "
+            "Trang có thể yêu cầu JavaScript, đăng nhập hoặc chỉ hiển thị một phần."
+        )
+
+    return {
+        "url": url,
+        "title": title,
+        "text": text.strip(),
+        "status_code": response.status_code,
+        "content_type": response.headers.get("content-type", ""),
+    }
+
+
+def make_reader_html(article: dict) -> str:
+    title = html.escape(article["title"])
+    url = html.escape(article["url"])
+    paragraphs = "\n".join(
+        f"<p>{html.escape(p.strip())}</p>"
+        for p in re.split(r"\n{2,}", article["text"])
+        if p.strip()
     )
-    
-    btn_col1, btn_col2 = st.columns([2, 1])
-    with btn_col1:
-        submit_btn = st.button("🚀 Cào & Bóc Tách Bài Viết", type="primary", use_container_width=True)
-    with btn_col2:
-        if st.button("🧹 Clear", use_container_width=True):
-            st.session_state.scraped_data = None
-            st.rerun()
-
-    if submit_btn:
-        if not url_input.strip():
-            st.warning("⚠️ Vui lòng nhập URL bài viết!")
-        else:
-            url = url_input.strip()
-            if not url.startswith(('http://', 'https://')):
-                url = 'https://' + url
-
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-            }
-            context = ssl._create_unverified_context()
-
-            with st.spinner("⏳ Đang cào dữ liệu & dọn dẹp rác..."):
-                try:
-                    req = urllib.request.Request(url, headers=headers)
-                    with urllib.request.urlopen(req, context=context) as response:
-                        html_content = response.read().decode('utf-8', errors='ignore')
-                        paragraphs = clean_html_content(html_content)
-
-                        if not paragraphs:
-                            st.error("⚠️ Không lấy được nội dung văn bản nào từ URL này.")
-                        else:
-                            timestamp = int(time.time())
-                            filename = f"article_{timestamp}.html"
-                            
-                            body_html = "\n".join([f"<p>{p}</p>" for p in paragraphs])
-                            full_html = f"""<!DOCTYPE html>
+    return f"""<!doctype html>
 <html lang="vi">
 <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Article Reader - {timestamp}</title>
-    <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; line-height: 1.8; max-width: 720px; margin: 40px auto; padding: 0 20px; color: #222; background-color: #fcfcfc; }}
-        p {{ margin-bottom: 1.5em; font-size: 1.05rem; }}
-        .meta {{ font-size: 0.85rem; color: #666; border-bottom: 1px solid #eee; padding-bottom: 10px; margin-bottom: 25px; }}
-    </style>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title>
+<style>
+body{{font-family:system-ui,-apple-system,sans-serif;line-height:1.75;max-width:760px;margin:3rem auto;padding:0 1.2rem;color:#222;background:#fff}}
+.meta{{color:#666;border-bottom:1px solid #ddd;padding-bottom:1rem;margin-bottom:2rem}}
+p{{font-size:1.05rem}}
+</style>
 </head>
-<body>
-    <div class="meta">Nguồn: <a href="{url}" target="_blank">{url}</a></div>
-    {body_html}
-</body>
+<body><div class="meta"><strong>{title}</strong><br>Source: <a href="{url}">{url}</a></div>{paragraphs}</body>
 </html>"""
 
-                            st.session_state.scraped_data = {
-                                "filename": filename,
-                                "html_content": full_html,
-                                "full_text": "\n\n".join(paragraphs),
-                                "count": len(paragraphs)
-                            }
-                except Exception as e:
-                    st.error(f"❌ Lỗi khi bóc tách dữ liệu: {e}")
 
-    # Hiển thị thông tin file & Nút Download
-    if st.session_state.scraped_data:
-        data = st.session_state.scraped_data
-        st.markdown("---")
-        st.success(f"🎉 **THÀNH CÔNG!**\n- **Tên file:** `{data['filename']}`\n- **Tổng số:** {data['count']} đoạn văn")
-        
-        st.download_button(
-            label="📥 Tải File HTML Reader về máy",
-            data=data["html_content"],
-            file_name=data["filename"],
-            mime="text/html",
-            use_container_width=True
-        )
+st.set_page_config(page_title="Article Reader", page_icon="📰", layout="wide")
+st.title("Article Reader")
+st.caption(
+    "Đọc và làm sạch nội dung HTML công khai. Ứng dụng không vượt paywall, "
+    "CAPTCHA, đăng nhập hoặc anti-bot."
+)
 
-# --- CỘT PHẢI: FULL READER CONTENT ---
-with col2:
-    st.subheader("📖 Nội dung trọn vẹn (Full Reader Content)")
-    if st.session_state.scraped_data:
-        st.text_area(
-            label="Nội dung bài viết",
-            value=st.session_state.scraped_data["full_text"],
-            height=520,
-            label_visibility="collapsed"
-        )
+with st.sidebar:
+    st.subheader("Cài đặt")
+    timeout = st.slider("Timeout (giây)", min_value=5, max_value=60, value=20)
+    st.markdown(
+        "**Lưu ý:** Một số nhà xuất bản có thể từ chối request tự động dù bài viết "
+        "có thể mở bằng trình duyệt. Khi đó ứng dụng sẽ hiển thị lỗi 403 rõ ràng."
+    )
+
+url = st.text_input("URL bài viết", placeholder="https://example.com/article")
+run = st.button("Đọc bài viết", type="primary", use_container_width=True)
+
+if run:
+    if not url.strip():
+        st.warning("Vui lòng nhập URL bài viết.")
     else:
-        st.info("Nội dung sạch sẽ hiển thị trọn vẹn tại đây sau khi bạn dán URL và bấm Cào.")
+        try:
+            with st.spinner("Đang tải và bóc tách nội dung..."):
+                normalized_url = validate_url(url)
+                raw_html, response = fetch_html(normalized_url, timeout=timeout)
+                article = extract_article(normalized_url, raw_html, response)
+            st.session_state["article"] = article
+            st.success(
+                f"Đã đọc: {article['title']} — "
+                f"{len(article['text']):,} ký tự"
+            )
+        except FetchError as exc:
+            st.session_state.pop("article", None)
+            st.error(str(exc))
+        except Exception as exc:
+            st.session_state.pop("article", None)
+            st.error(f"Lỗi không dự kiến: {type(exc).__name__}: {exc}")
+
+article = st.session_state.get("article")
+if article:
+    st.subheader(article["title"])
+    st.caption(f"Nguồn: {article['url']}")
+    left, right = st.columns([3, 1])
+    with left:
+        st.text_area("Nội dung", article["text"], height=620, label_visibility="collapsed")
+    with right:
+        st.metric("Số ký tự", f"{len(article['text']):,}")
+        st.metric("Số từ", f"{len(article['text'].split()):,}")
+        filename = re.sub(r"[^a-zA-Z0-9_-]+", "_", article["title"]).strip("_")[:60] or "article"
+        st.download_button(
+            "Tải TXT",
+            data=article["text"],
+            file_name=f"{filename}.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
+        st.download_button(
+            "Tải Reader HTML",
+            data=make_reader_html(article),
+            file_name=f"{filename}.html",
+            mime="text/html",
+            use_container_width=True,
+        )
+else:
+    st.info("Nhập URL rồi bấm “Đọc bài viết”.")
